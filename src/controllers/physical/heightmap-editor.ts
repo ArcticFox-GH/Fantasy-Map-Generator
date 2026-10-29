@@ -21,7 +21,7 @@ import { Grid } from "@/model/graph/grid-generator";
 import { MapRestoration } from "@/model/map-restoration";
 import { Options } from "@/model/options/options-model";
 import { HeightmapGenerator } from "@/model/physical/heightmap-generator";
-import { getHeightUnitRatio, heightToMeters } from "@/model/units";
+import { getHeightUnitRatio, heightToMeters, metersToHeight } from "@/model/units";
 import { HeightmapColorSchemes } from "@/renderers/heightmap/heightmap-color-schemes";
 import { Layers } from "@/renderers/layers";
 import { moveCircle, removeCircle } from "@/renderers/overlays/brush-circle";
@@ -63,6 +63,9 @@ let edits: Uint8Array[] & { n: number } = Object.assign([], { n: 0 });
 let templateInput: HTMLInputElement | null = null;
 let riskBaseHeights: Uint8Array | null = null; // the heights of the map when Risk editing began
 let converterInput: HTMLInputElement | null = null;
+let cellGrays: Uint8Array | null = null; // luminance of the loaded image per grid cell
+let shoreCell: number | null = null; // the clicked cell with the lowest land color in sea level mode
+let seaLevelMode = false;
 
 function open(options?: { mode?: string; tool?: string }): void {
   filterState = dialogState.get(dialogId, "filters", (): FilterState => ({ cellType: "all" }));
@@ -235,6 +238,11 @@ function renderImageConverter(): void {
           data-tip="${t("Auto-assign colors using generator scheme (for exported colored heightmaps)")}"
           class="icon-layer-group"
         ></button>
+        <button
+          id="convertSeaLevel"
+          data-tip="${t("Assign heights by sea level: click the lowest land color on the map (for grayscale heightmaps)")}"
+          class="icon-target"
+        ></button>
         <button id="convertColorsButton" data-tip="${t("Set maximum number of colors")}" class="icon-signal"></button>
         <input id="convertColors" value="100" style="display: none" />
         <button
@@ -247,6 +255,23 @@ function renderImageConverter(): void {
         <i>${t("Overlay opacity")}:</i><br />
         <input id="convertOverlay" type="range" min="0" max="1" step=".01" value="0" style="width: 12.6em" />
         <input id="convertOverlayNumber" type="number" min="0" max="1" step=".01" value="0" style="width: 4.2em" />
+      </div>
+      <div id="seaLevelPanel" style="display: none; padding-top: 0.4em">
+        <div data-tip="${t("Height of the brightest color")}">
+          <i>${t("Max height")}:</i>
+          <input id="seaLevelMaxHeight" type="number" min="1" step="1" style="width: 5em" />
+          <span class="seaLevelUnit"></span>
+        </div>
+        <div data-tip="${t("Depth of the darkest color")}">
+          <i>${t("Max depth")}:</i>
+          <input id="seaLevelMaxDepth" type="number" min="1" step="1" style="width: 5em" />
+          <span class="seaLevelUnit"></span>
+        </div>
+        <label data-tip="${t("Treat dark colors as high and bright colors as low")}">
+          <input id="seaLevelInvert" type="checkbox" class="checkbox" />
+          <span class="checkbox-label">${t("Invert")}</span>
+        </label>
+        <div id="seaLevelInfo">${t("Click the lowest land color on the map")}</div>
       </div>
       <div data-tip="${t("Select a color to assign a height value")}" id="colorsSelect" style="display: none">
         <i>${t("Set height")}: </i>
@@ -289,6 +314,9 @@ function renderImageConverter(): void {
   ensureEl("convertAutoLum").addEventListener("click", () => autoAssing("lum"));
   ensureEl("convertAutoHue").addEventListener("click", () => autoAssing("hue"));
   ensureEl("convertAutoFMG").addEventListener("click", () => autoAssing("scheme"));
+  ensureEl("convertSeaLevel").addEventListener("click", toggleSeaLevelMode);
+  for (const id of ["seaLevelMaxHeight", "seaLevelMaxDepth", "seaLevelInvert"])
+    ensureEl(id).addEventListener("change", applySeaLevel);
   ensureEl("convertColorsButton").addEventListener("click", setConvertColorsNumber);
   ensureEl("convertComplete").addEventListener("click", applyConversion);
   ensureEl("convertCancel").addEventListener("click", cancelConversion);
@@ -1630,6 +1658,11 @@ function heightsFromImage(count: number): void {
   sampleCanvas.height = grid.cellsY;
   sampleCanvas.getContext("2d")!.drawImage(sourceImage, 0, 0, grid.cellsX, grid.cellsY);
 
+  const pixels = sampleCanvas.getContext("2d")!.getImageData(0, 0, grid.cellsX, grid.cellsY).data;
+  cellGrays = Uint8Array.from(grid.cells.i, i =>
+    Math.round(0.299 * pixels[i * 4] + 0.587 * pixels[i * 4 + 1] + 0.114 * pixels[i * 4 + 2])
+  );
+
   const q = new RgbQuant({ colors: count });
   q.sample(sampleCanvas);
   const data = q.reduce(sampleCanvas);
@@ -1664,9 +1697,15 @@ function heightsFromImage(count: number): void {
     .on("click", colorClicked);
 
   ensureEl("colorsUnassignedNumber").innerHTML = String(colors.length);
+  if (seaLevelMode) showSeaLevelPanel();
 }
 
 function mapClicked(this: SVGElement): void {
+  if (seaLevelMode) {
+    shoreCell = +this.id.slice(4);
+    applySeaLevel();
+    return;
+  }
   const fill = this.getAttribute("fill");
   const palleteColor = ensureEl("imageConverter").querySelector<HTMLElement>(`div[data-color="${fill}"]`);
   palleteColor?.click();
@@ -1730,6 +1769,7 @@ function assignHeight(this: HTMLElement): void {
 
 // auto assign color based on luminosity or hue
 function autoAssing(type: string): void {
+  if (seaLevelMode) toggleSeaLevelMode();
   const colorsUnassignedContainer = ensureEl("colorsUnassignedContainer");
   let unassigned = colorsUnassignedContainer.querySelectorAll<HTMLElement>("div");
   if (!unassigned.length) {
@@ -1820,8 +1860,76 @@ function setOverlayOpacity(v: number): void {
   ensureEl("canvas").style.opacity = String(v);
 }
 
+function toggleSeaLevelMode(): void {
+  if (!cellGrays) {
+    tip(t("Please load an image first"), false, "error");
+    return;
+  }
+  seaLevelMode = !seaLevelMode;
+  shoreCell = null;
+  ensureEl("convertSeaLevel").classList.toggle("pressed", seaLevelMode);
+  ensureEl("seaLevelPanel").style.display = seaLevelMode ? "block" : "none";
+  heightsFromImage(+ensureEl<HTMLInputElement>("convertColors").value); // restores the color fills
+}
+
+function showSeaLevelPanel(): void {
+  for (const id of ["colorsSelect", "colorsAssigned", "colorsUnassigned"]) ensureEl(id).style.display = "none";
+  const unit = options.map.units.height.unit;
+  for (const el of document.querySelectorAll(".seaLevelUnit")) el.textContent = unit;
+  const maxHeight = ensureEl<HTMLInputElement>("seaLevelMaxHeight");
+  const maxDepth = ensureEl<HTMLInputElement>("seaLevelMaxDepth");
+  if (!maxHeight.value) maxHeight.value = String(rn(heightToMeters(100) * getHeightUnitRatio()));
+  if (!maxDepth.value) maxDepth.value = String(rn(-heightToMeters(1) * getHeightUnitRatio()));
+  ensureEl("seaLevelInfo").innerHTML = t("Click the lowest land color on the map");
+  tip(t("Click the lowest land color on the map. Click again to adjust the coastline"), false, "warn");
+}
+
+function getGray(cell: number): number {
+  const gray = cellGrays![cell];
+  return ensureEl<HTMLInputElement>("seaLevelInvert").checked ? 255 - gray : gray;
+}
+
+function applySeaLevel(): void {
+  if (!seaLevelMode || shoreCell === null || !cellGrays) return;
+  const ratio = getHeightUnitRatio();
+  const maxHeight = Math.max(1, +ensureEl<HTMLInputElement>("seaLevelMaxHeight").value) / ratio;
+  const maxDepth = Math.max(1, +ensureEl<HTMLInputElement>("seaLevelMaxDepth").value) / ratio;
+  const grays = Array.from(grid.cells.i, getGray);
+  const top = Math.max(...grays);
+  const shore = grays[shoreCell];
+
+  const heights = grays.map(gray => {
+    if (gray >= shore)
+      return minmax(Math.round(metersToHeight(((gray - shore) / Math.max(1, top - shore)) * maxHeight)), 20, 100);
+    return minmax(Math.round(metersToHeight((-(shore - gray) / shore) * maxDepth)), 1, 19);
+  });
+
+  select<SVGElement, unknown>("#viewbox")
+    .select("#heights")
+    .selectAll<SVGPolygonElement, number>("polygon")
+    .each(function (cell) {
+      const height = heights[cell];
+      this.setAttribute("fill", heightColor(1 - (height < 20 ? height - 5 : height) / 100));
+      this.setAttribute("data-height", String(height));
+    });
+
+  const land = heights.filter(height => height >= 20).length;
+  const info = sentences(
+    t("Sea level color: {{gray}}", { gray: shore }),
+    t("Land: {{land}}", { land: `${rn((land / heights.length) * 100)}%` })
+  );
+  const cap = t("Max height is capped at {{height}}", {
+    height: `${rn(heightToMeters(100) * ratio)} ${options.map.units.height.unit}`
+  });
+  ensureEl("seaLevelInfo").innerHTML = maxHeight > heightToMeters(100) ? sentences(info, cap) : info;
+}
+
 function applyConversion(): void {
-  if (ensureEl("colorsAssignedContainer").childElementCount < 3) {
+  if (seaLevelMode && shoreCell === null) {
+    tip(t("Please click the lowest land color on the map first"), false, "error");
+    return;
+  }
+  if (!seaLevelMode && ensureEl("colorsAssignedContainer").childElementCount < 3) {
     tip(t("Please assign colors to heights first"), false, "error");
     return;
   }
@@ -1847,6 +1955,8 @@ function cancelConversion(): void {
 }
 
 function restoreImageConverterState(): void {
+  cellGrays = shoreCell = null;
+  seaLevelMode = false;
   findEl("canvas")?.remove();
   findEl("imageToConvert")?.remove();
 
